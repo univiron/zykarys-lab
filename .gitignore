@@ -1,0 +1,8 @@
+# Credentials never enter a repo. These names catch the common accidents; scripts/scan-secrets.sh catches the rest.
+.env
+.env.*
+*.token
+*.pem
+*.key
+.DS_Store
+node_modules/
