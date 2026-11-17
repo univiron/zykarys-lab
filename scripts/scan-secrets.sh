@@ -10,12 +10,15 @@
 # A hit names the file, the line and the pattern, never the text: that line holds the credential, and printing it
 # would put the key into the CI log or the session transcript that the scan just kept it out of git for.
 # Exit 0 clean, 1 a hit, 2 the scan could not run (no repo, BASE not a commit here, a shallow history that cuts
-# the range short, or a grep that does not behave as the scan reads it), which says nothing about the tree.
+# the range short, a tracked file that is missing or can't be read, or a grep that does not behave as the scan reads
+# it), which says nothing about the tree.
 # scripts/scan-secrets.test.sh checks it offline, one made-up key per pattern: run it after any change here.
 # `command grep` bypasses any shell function named grep (Claude Code defines one that honours .gitignore).
 set -u
 # Bytes, not characters, and every file as text (grep -a): a key inside a file that holds a NUL byte is still a key,
 # and under a UTF-8 locale grep takes a line with one invalid byte for binary and prints nothing, though it matched.
+# Text saved as UTF-16 (what PowerShell 5's ">" writes) has a NUL byte beside every character, so no pattern matches
+# its bytes as they are: a file that holds NUL bytes is read a second time with them taken out, and so is the history.
 export LC_ALL=C
 setup() { echo "scan-secrets: $*: nothing was scanned" >&2; exit 2; }
 [ $# -le 1 ] || setup "usage: scan-secrets.sh [BASE]"
@@ -32,15 +35,20 @@ EOF
 # stores), ghu_ user-to-server, ghs_ server-to-server, ghr_ refresh; github_pat_ fine-grained.
 # sk-key alone misses today's vendor keys: a hyphen follows their prefix (sk-ant-api03-, sk-proj-), and that
 # breaks its run of 20. Their own patterns are tied to the prefix, since a bare sk- that allowed hyphens would match
-# any kebab-case word ending in sk (task-list-...).
+# any kebab-case word ending in sk (task-list-...). sk-key itself starts at the line's start or after a character
+# that is not a letter, digit, "_" or "-", so a name like task-<32 hex digits> is not a key.
+# aws-access-key-id: AKIA is a long-lived key's id, ASIA a temporary one's (STS, an assumed role).
+# aws-secret-access-key: the line an AWS credentials file or env file gives the secret on, in either case, with or
+# without spaces around its "=" or ":"; assigned-secret can't see it (lower case, and the value holds "/").
 # x-bearer: an app's bearer token is 21 A's, then text with a URL-encoded or plain "=" in its middle. The "=" is what
 # tells it from base64 of zero bytes (AAAA... in any embedded image), where "=" only ever ends the text.
 # assigned-secret: a line shaped like an env file's, NAME=value from the line's start (or after "export"), where the
-# UPPER_CASE name holds TOKEN, SECRET, PASSWORD, API_KEY or PRIVATE_KEY and the value is 32 or more characters with
-# no dot, slash, space or "$". Narrow on purpose: prose, code, a quoted example in a README, a path, a URL, another
-# variable or a short placeholder is not reported, so a hit is worth reading. The optional "+" is how the line
-# reads in a commit's diff.
-names=(hq-key pem-private-key github-token github-pat aws-access-key-id sk-key anthropic-key openai-key stripe-key
+# UPPER_CASE name holds TOKEN, SECRET, PASSWORD, API_KEY or PRIVATE_KEY and the value starts with 32 or more
+# characters that are not a slash, space or "$", and no "/" or "$" follows them. Narrow on purpose: prose, code, a
+# quoted example in a README, a path, a URL, another variable or a short placeholder is not reported, so a hit is
+# worth reading. Any run of spaces, tabs and "+" may come first: an indented line, and the "+" a commit's diff puts
+# before each line it adds, whatever that line itself starts with.
+names=(hq-key pem-private-key github-token github-pat aws-access-key-id aws-secret-access-key sk-key anthropic-key openai-key stripe-key
   slack-token google-api-key telegram-bot-token google-oauth-token google-refresh-token x-bearer assigned-secret
   jwk-private-d)
 res=(
@@ -48,8 +56,9 @@ res=(
   '-----BEGIN [A-Z ]*PRIVATE KEY( BLOCK)?-----'
   'gh[pousr]_[A-Za-z0-9]{30,}'
   'github_pat_[A-Za-z0-9_]{30,}'
-  'AKIA[0-9A-Z]{16}'
-  'sk-[A-Za-z0-9]{20,}'
+  '(AKIA|ASIA)[0-9A-Z]{16}'
+  '[Aa][Ww][Ss]_[Ss][Ee][Cc][Rr][Ee][Tt]_[Aa][Cc][Cc][Ee][Ss][Ss]_[Kk][Ee][Yy]["'"'"']?[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9/+]{40}'
+  '(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9]{20,}'
   '\bsk-ant-[A-Za-z0-9_-]{20,}'
   '\bsk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}'
   '\bsk_(live|test)_[A-Za-z0-9]{16,}'
@@ -59,7 +68,7 @@ res=(
   '\bya29\.[A-Za-z0-9_-]{30,}'
   '\b1//0[A-Za-z0-9_-]{40,}'
   'AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%+/]{15,}(%3D|=)[A-Za-z0-9%]{20,}'
-  '^[+ ]?(export[[:space:]]+)?[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*=["'"'"']?[A-Za-z0-9_+=-]{32,}'
+  '^[+[:space:]]*(export[[:space:]]+)?[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)[A-Z0-9_]*=["'"'"']?[A-Za-z0-9_+=-]{32,}([^A-Za-z0-9_+=/$-]|$)'
   "$jwk"
 )
 
@@ -96,6 +105,18 @@ got=$(printf '%s\0' "$work/probe" | xargs -0 -r grep -HanZE -e 'pro+be' -- 2>/de
 for i in "${!res[@]}"; do
   command grep -qE -e "${res[$i]}" "$work/probe" 2>/dev/null; [ $? -le 1 ] || setup "this grep rejects the ${names[$i]} pattern"
 done
+# And grep is shown to tell a file that holds a NUL byte from one that does not: -L -I lists the first, not the second.
+printf 'a\0b\n' > "$work/probe0"
+got=$(printf '%s\0' "$work/probe" "$work/probe0" | xargs -0 -r grep -LZI -e '' -- 2>/dev/null | tr '\0' '|')
+[ "$got" = "$work/probe0|" ] || setup "this grep does not answer -LZI the way the scan reads it (GNU grep is needed)"
+
+# Every tracked file must be there to read: grep's own complaint about one it can't open is not seen below, and a
+# file skipped is not a file found clean. A symlink is its target's name, not text, and a submodule is a directory.
+while IFS= read -r -d '' file; do
+  if [ -L "$file" ] || [ -d "$file" ]; then continue; fi
+  [ -f "$file" ] || setup "tracked file '$file' is missing from the working tree"
+  [ -r "$file" ] || setup "tracked file '$file' can't be read"
+done < <(git ls-files -z)
 
 # The tree: grep -Z ends each file name with a NUL, so a name holding a colon or a newline comes through whole, and
 # only the line number is kept from what follows it. xargs runs grep the program, never a shell function.
@@ -104,15 +125,28 @@ for i in "${!res[@]}"; do
     printf '  %s:%s: %s\n' "$file" "${rest%%:*}" "${names[$i]}" >> "$work/hits"
   done < <(git ls-files -z | xargs -0 -r grep -HanZE -e "${res[$i]}" -- 2>/dev/null)
 done
+# The tree again, for each file that holds a NUL byte, with the NULs taken out: UTF-16 text then reads as plain text,
+# line for line. (-L -I also lists an empty file, which is skipped.)
+while IFS= read -r -d '' file; do
+  if [ -L "$file" ] || [ ! -s "$file" ]; then continue; fi
+  tr -d '\000' < "$file" > "$work/flat" || setup "can't read '$file'"
+  for i in "${!res[@]}"; do
+    while IFS= read -r n; do
+      printf '  %s:%s: %s\n' "$file" "$n" "${names[$i]}" >> "$work/hits"
+    done < <(command grep -anE -e "${res[$i]}" "$work/flat" | cut -d: -f1)
+  done
+done < <(git ls-files -z | xargs -0 -r grep -LZI -e '' -- 2>/dev/null)
 
 # The range: each line a commit adds, as "<log line> TAB <commit> TAB <file> TAB <line in the new file>", from the
 # hunk headers and their counts (git quotes a path holding a tab). A content line is told from a file header by the
 # hunk's remaining counts, so an added line reading "++ b/x" (shown as "+++ b/x") stays content, and an empty line
 # is context (diff.suppressBlankEmpty prints one so). A merge is read as its diff against its first parent.
-# --text: a binary file's change is printed as lines too, not as "Binary files differ".
+# --text: a binary file's change is printed as lines too, not as "Binary files differ". The NUL bytes are taken out
+# of the whole log, so a line of UTF-16 text reads as plain text here as well; the line count is unchanged.
 if [ -n "$base" ]; then
   git log -p --text --no-color --no-ext-diff --no-textconv --no-renames --diff-merges=first-parent \
-    --src-prefix=a/ --dst-prefix=b/ --format='commit %H' "$range" > "$work/log" || setup "git log failed on $range"
+    --src-prefix=a/ --dst-prefix=b/ --format='commit %H' "$range" > "$work/log.raw" || setup "git log failed on $range"
+  tr -d '\000' < "$work/log.raw" > "$work/log" || setup "can't read the log of $range"
   awk 'BEGIN { OFS = "\t" }
     old <= 0 && new <= 0 && /^commit [0-9a-f]+$/ { sha = substr($2, 1, 12); next }
     old <= 0 && new <= 0 && /^\+\+\+ / {

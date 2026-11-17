@@ -42,6 +42,9 @@ pem-private-key	-----BEGIN RSA PRIV${q}ATE KEY-----
 github-token	k=gh${q}p_$(m 36)
 github-pat	k=github${q}_pat_$(m 40)
 aws-access-key-id	k=AKI${q}AABCDEFGHIJKLMNOP
+aws-access-key-id	aws_access_key_id = ASI${q}AABCDEFGHIJKLMNOP
+aws-secret-access-key	aws_sec${q}ret_access_key = $(m 40)
+aws-secret-access-key	AWS_SEC${q}RET_ACCESS_KEY="$(m 20)/$(m 19)"
 sk-key	k=s${q}k-$(m 24)
 anthropic-key	k=s${q}k-ant-api03-$(m 40)
 openai-key	k=s${q}k-proj-$(m 40)
@@ -55,6 +58,7 @@ x-bearer	k=$A21$(m 24)%3${q}D$(m 40)
 x-bearer	k=$A21$(m 24)=$(m 40)
 assigned-secret	MY_API_TO${q}KEN=$(m 40)
 assigned-secret	export BOT_SEC${q}RET="$(m 32)"
+assigned-secret	    INDENTED_TO${q}KEN=$(m 40)
 jwk-private-d	"d": "$(m 43)"
 EOF2
 )
@@ -62,10 +66,12 @@ EOF2
 clean=$(cat <<EOF2
 GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
 API_TOKEN=\$OTHER_VARIABLE_WITH_A_LONG_NAME_INDEED
-TOKEN_FILE=/home/someone/.config/some/long/path/to/a/token/file.txt
+TOKEN_FILE=/opt/app/.config/some/long/path/to/a/token/file.txt
 SECRET_URL=https://example.invalid/a/long/path/that/is/not/a/secret
 PASSWORD=changeme
 the task-list-of-things-that-go-on-and-on-for-a-while is kebab case
+job tas${q}k-0123456789abcdef0123456789abcdef finished
+CACHE_TO${q}KEN=$(m 32)/and/then/a/path
 data:image/png;base64,iVBORw0KGgo${A21}${A21}ABAAEAAAICRAEAOw==
 a token is a thing you hold and a secret is a thing you keep to yourself always
 call 1234567890 at 10:30
@@ -102,15 +108,36 @@ run "$r"; if [ "$rc" = 0 ]; then ok; else bad "removed key: the tree should be c
 run "$r" "$base"; if [ "$rc" = 1 ]; then ok; else bad "removed key: BASE..HEAD missed it (rc=$rc)"; fi
 run "$r" --history; if [ "$rc" = 1 ]; then ok; else bad "removed key: --history missed it (rc=$rc)"; fi
 
+# 4b. A line a commit adds that itself starts with a space or a "+", then is removed: the history still reports it.
+r=$T/lead; newrepo "$r"; base=$(git -C "$r" rev-parse HEAD)
+printf '  MY_API_TO''KEN=%s\n+OTHER_SEC''RET=%s\n' "$(m 40)" "$(m 40)" > "$r/e.env"; git -C "$r" add e.env; git -C "$r" commit -q -m add
+git -C "$r" rm -q e.env; git -C "$r" commit -q -m remove
+run "$r" "$base"; if [ "$rc" = 1 ] && command grep -q 'e.env:1: assigned-secret' <<<"$out" && command grep -q 'e.env:2: assigned-secret' <<<"$out"; then ok; else bad "an added line starting with a space or + was missed in the history (rc=$rc)"; fi
+
+# 4c. UTF-16 text (a NUL beside every character): in the tree, and in the history after it is removed.
+r=$T/u16; newrepo "$r"
+{ printf 'first line\nk=gh''p_%s\n' "$(m 36)" | sed 's/./&\x00/g; s/$/\x00/' | sed '1s/^/\xff\xfe/'; } > "$r/env.txt"; git -C "$r" add env.txt
+run "$r"; if [ "$rc" = 1 ] && command grep -qF 'env.txt:2: github-token' <<<"$out"; then ok; else bad "a key in UTF-16 text was missed in the tree (rc=$rc)"; fi
+git -C "$r" commit -q -m add; git -C "$r" rm -q env.txt; git -C "$r" commit -q -m remove
+run "$r" --history; if [ "$rc" = 1 ] && command grep -q 'env.txt:2: github-token' <<<"$out"; then ok; else bad "a key in UTF-16 text was missed in the history (rc=$rc)"; fi
+
 # 5. What can't be scanned is exit 2, never clean.
 run "$r" no-such-commit; if [ "$rc" = 2 ]; then ok; else bad "an unknown BASE gave rc=$rc, wanted 2"; fi
 mkdir "$T/norepo"; run "$T/norepo"; if [ "$rc" = 2 ]; then ok; else bad "outside a repo gave rc=$rc, wanted 2"; fi
+r=$T/gone; newrepo "$r"; printf 'x\n' > "$r/a.txt"; printf 'y\n' > "$r/b.txt"; git -C "$r" add -A; rm "$r/b.txt"
+run "$r"; if [ "$rc" = 2 ]; then ok; else bad "a tracked file missing from the tree gave rc=$rc, wanted 2"; fi
+# Root reads any file, so the unreadable case can only be checked as another user.
+if [ "$(id -u)" != 0 ]; then
+  printf 'y\n' > "$r/b.txt"; chmod 000 "$r/b.txt"
+  run "$r"; if [ "$rc" = 2 ]; then ok; else bad "a tracked file that can't be read gave rc=$rc, wanted 2"; fi
+  chmod 644 "$r/b.txt"
+fi
 
 # 6. This file and the scanner are clean under the scan themselves.
 r=$T/self; newrepo "$r"; mkdir "$r/scripts"; cp "$scan" "${BASH_SOURCE[0]}" "$r/scripts/"; git -C "$r" add -A
 run "$r"; if [ "$rc" = 0 ]; then ok; else bad "the scanner or its test trips the scan: $out"; fi
 
 # A positive control on the checks themselves: with no made-up key ever reported, sections 1 to 4 proved nothing.
-[ "$n" -ge 19 ] || setup "the list of made-up keys came through short ($n)"
+[ "$n" -ge 23 ] || setup "the list of made-up keys came through short ($n)"
 echo "scan-secrets.test.sh: $pass passed, $fail failed"
 [ "$fail" = 0 ]
