@@ -10,8 +10,8 @@
 # A hit names the file, the line and the pattern, never the text: that line holds the credential, and printing it
 # would put the key into the CI log or the session transcript that the scan just kept it out of git for.
 # Exit 0 clean, 1 a hit, 2 the scan could not run (no repo, BASE not a commit here, a shallow history that cuts
-# the range short, a tracked file that is missing or can't be read, or a grep that does not behave as the scan reads
-# it), which says nothing about the tree.
+# the range short, a tracked file that is missing or can't be read, a grep that does not behave as the scan reads
+# it, or no perl to decode UTF-16), which says nothing about the tree.
 # scripts/scan-secrets.test.sh checks it offline, one made-up key per pattern: run it after any change here.
 # `command grep` bypasses any shell function named grep (Claude Code defines one that honours .gitignore).
 set -u
@@ -19,6 +19,9 @@ set -u
 # and under a UTF-8 locale grep takes a line with one invalid byte for binary and prints nothing, though it matched.
 # Text saved as UTF-16 (what PowerShell 5's ">" writes) has a NUL byte beside every character, so no pattern matches
 # its bytes as they are: a file that holds NUL bytes is read a second time with them taken out, and so is the history.
+# Taking them out is not enough when a character that is not ASCII stands right before a key: its other byte is left
+# against the key (キーは then "sk-ant..." reads "...0sk-ant..."). So such a file, and the history, is read a third time,
+# decoded (u16 below). Each reading only adds what it finds; none replaces another.
 export LC_ALL=C
 setup() { echo "scan-secrets: $*: nothing was scanned" >&2; exit 2; }
 [ $# -le 1 ] || setup "usage: scan-secrets.sh [BASE]"
@@ -72,6 +75,75 @@ res=(
   "$jwk"
 )
 
+# u16 IN OUT: IN read as UTF-16, written to OUT.0 to OUT.3, one line out for each line in, so a line number in any of
+# them is that line of IN. The lines are IN's own, split at each newline byte as grep splits them; in UTF-16 text a
+# character whose code holds that byte (《 is U+300A) splits a line too, in every reading alike.
+# Four readings of each line, because which bytes pair up is not known: little endian (OUT.0, OUT.1) and big endian
+# (OUT.2, OUT.3), each from the line's first byte and from its second. A byte-order mark says nothing about a line
+# after the first; the newline's other byte starts the next line; a diff puts "+" before each line it adds; and text
+# can start at an odd offset inside a binary file.
+# Keys are ASCII, so only ASCII needs to survive: a printable character or a tab is kept, a byte-order mark is
+# dropped, and anything else (kana, a surrogate, a control character) becomes one \x01 byte, which no pattern takes
+# into a key and which ends a word as the character it stands for does. A last odd byte is left out. Nothing here can
+# fail on the bytes it is given; a read or write that fails is an error, never an early end.
+# The cost, accepted: a reading with the wrong pairing can fold the letter after a character that is not ASCII into
+# its \x01, so contrived text ("キask-" and 32 hex digits) can read as a key there. None did in the org's 35 repos or in
+# 4,800 real binaries (fonts, images, libraries, firmware); a false hit is reported, never a key hidden.
+# A line is decoded only if it holds 8 ASCII characters in a row as UTF-16 does (each beside a NUL): every pattern
+# needs at least that many, and most binary data has none, so its lines come out empty. perl-base is enough (unpack).
+# A line is decoded in 64 KiB pieces, each written out at once: unpack makes a list of every code unit, and one long
+# line passing that test would otherwise cost some 65 bytes of memory per byte of it (a 16 MB line took 1 GB).
+# Every call passes "--" first: a tracked file's name can start with "-", and perl would take it for a switch (one
+# named "-e..." runs code).
+u16=$(cat <<'EOF'
+my ($in, $out) = @ARGV;
+open(my $fh, '<:raw', $in) or die "can't read $in\n";
+my @o;
+for my $i (0 .. 3) { open($o[$i], '>:raw', "$out.$i") or die "can't write $out.$i\n" }
+$/ = "\n";
+my $piece = 65536;
+while (my $line = <$fh>) {
+  chomp $line;
+  if ($line =~ /(?:[\t\x20-\x7e]\x00){8}|(?:\x00[\t\x20-\x7e]){8}/) {
+    my $i = 0;
+    for my $order ('v', 'n') {
+      for my $at (0, 1) {
+        for (my $k = $at; $k < length($line); $k += $piece) {
+          print { $o[$i] } join '', map { $_ == 0xfeff ? '' : ($_ == 9 || ($_ >= 0x20 && $_ < 0x7f)) ? chr($_) : "\x01" }
+            unpack("$order*", substr($line, $k, $piece));
+        }
+        $i++;
+      }
+    }
+  }
+  print { $o[$_] } "\n" for 0 .. 3;
+}
+close($fh) or die "can't read $in\n";
+for (@o) { close($_) or die "can't write $out\n" }
+EOF
+)
+# nul: of the NUL-ended file names on stdin, print those whose file holds a NUL byte anywhere, read whole. grep -L -I
+# judges a file by its first buffer (some 96 KB), so text that starts plain and holds UTF-16 further on was never
+# read a second or third time (a review measured a key at line 2001 of a 125 KB file reading clean). A symlink or a
+# directory is skipped; a file that can't be opened or read is printed, so the read that follows fails loudly.
+nul=$(cat <<'EOF'
+$/ = "\0";
+while (my $f = <STDIN>) {
+  chomp $f;
+  next if -l $f || -d _;
+  my $has = 1;
+  if (open(my $fh, '<:raw', $f)) {
+    my ($n, $buf);
+    $has = 0;
+    while ($n = read($fh, $buf, 1 << 20)) { if (index($buf, "\0") >= 0) { $has = 1; last } }
+    $has = 1 unless defined $n;
+    close($fh);
+  }
+  print "$f\0" if $has;
+}
+EOF
+)
+
 # range: what git log reads. "BASE..HEAD" for a base, "HEAD" for the whole history (git log shows the first commit's
 # files as added, so a key in a rewritten first commit is read too).
 base= range=
@@ -102,13 +174,22 @@ printf 'probe\n' > "$work/probe"
 got=$(printf '%s\0' "$work/probe" | xargs -0 -r grep -HanZE -e 'pro+be' -- 2>/dev/null | tr '\0' '|')
 [ "$got" = "$work/probe|1:probe" ] || setup "this grep does not answer -HanZE the way the scan reads it (GNU grep is needed)"
 [ "$(command grep -anE -e 'pro+be' "$work/probe" 2>/dev/null | cut -d: -f1)" = 1 ] || setup "this grep does not answer -anE the way the scan reads it"
+[ "$(command grep -ahnE -e 'pro+be' "$work/probe" "$work/probe" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')" = '1 1 ' ] ||
+  setup "this grep does not answer -ahnE over two files the way the scan reads it"
 for i in "${!res[@]}"; do
   command grep -qE -e "${res[$i]}" "$work/probe" 2>/dev/null; [ $? -le 1 ] || setup "this grep rejects the ${names[$i]} pattern"
 done
-# And grep is shown to tell a file that holds a NUL byte from one that does not: -L -I lists the first, not the second.
+# And nul is shown to tell a file that holds a NUL byte from one that does not, the NUL early or 200 KB in.
 printf 'a\0b\n' > "$work/probe0"
-got=$(printf '%s\0' "$work/probe" "$work/probe0" | xargs -0 -r grep -LZI -e '' -- 2>/dev/null | tr '\0' '|')
-[ "$got" = "$work/probe0|" ] || setup "this grep does not answer -LZI the way the scan reads it (GNU grep is needed)"
+{ head -c 200000 /dev/zero | tr '\0' 'a'; printf '\n\0\n'; } > "$work/probe0late"
+got=$(printf '%s\0' "$work/probe" "$work/probe0" "$work/probe0late" | perl -e "$nul" 2>/dev/null | tr '\0' '|')
+[ "$got" = "$work/probe0|$work/probe0late|" ] || setup "perl did not tell the files holding a NUL byte (perl is needed)"
+# And u16 is shown to decode: "probeprobe" as UTF-16 on a second line, which starts with the first line's NUL, as
+# every line after the first of little-endian text does. Two of its four readings carry it, at line 2.
+printf 'x\n\0p\0r\0o\0b\0e\0p\0r\0o\0b\0e\0\n' > "$work/probe16"
+perl -e "$u16" -- "$work/probe16" "$work/probe16.out" 2>/dev/null || setup "perl did not run the UTF-16 reading (perl is needed)"
+got=$(command grep -ahn -e 'probeprobe' "$work/probe16.out".{0..3} 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
+[ "$got" = '2 2 ' ] || setup "the UTF-16 reading did not decode its probe"
 
 # Every tracked file must be there to read: grep's own complaint about one it can't open is not seen below, and a
 # file skipped is not a file found clean. A symlink is its target's name, not text, and a submodule is a directory.
@@ -125,28 +206,34 @@ for i in "${!res[@]}"; do
     printf '  %s:%s: %s\n' "$file" "${rest%%:*}" "${names[$i]}" >> "$work/hits"
   done < <(git ls-files -z | xargs -0 -r grep -HanZE -e "${res[$i]}" -- 2>/dev/null)
 done
-# The tree again, for each file that holds a NUL byte, with the NULs taken out: UTF-16 text then reads as plain text,
-# line for line. (-L -I also lists an empty file, which is skipped.)
+# The tree again, for each file that holds a NUL byte, with the NULs taken out (UTF-16 text then reads as plain text,
+# line for line) and decoded (u16), both searched at once: every one keeps the file's line numbers. Which files hold a
+# NUL is read whole (nul), not judged by grep's first buffer.
 while IFS= read -r -d '' file; do
   if [ -L "$file" ] || [ ! -s "$file" ]; then continue; fi
   tr -d '\000' < "$file" > "$work/flat" || setup "can't read '$file'"
+  perl -e "$u16" -- "$file" "$work/flat16" || setup "can't decode '$file'"
   for i in "${!res[@]}"; do
     while IFS= read -r n; do
       printf '  %s:%s: %s\n' "$file" "$n" "${names[$i]}" >> "$work/hits"
-    done < <(command grep -anE -e "${res[$i]}" "$work/flat" | cut -d: -f1)
+    done < <(command grep -ahnE -e "${res[$i]}" "$work/flat" "$work/flat16".{0..3} | cut -d: -f1)
   done
-done < <(git ls-files -z | xargs -0 -r grep -LZI -e '' -- 2>/dev/null)
+done < <(git ls-files -z | perl -e "$nul")
 
 # The range: each line a commit adds, as "<log line> TAB <commit> TAB <file> TAB <line in the new file>", from the
 # hunk headers and their counts (git quotes a path holding a tab). A content line is told from a file header by the
 # hunk's remaining counts, so an added line reading "++ b/x" (shown as "+++ b/x") stays content, and an empty line
 # is context (diff.suppressBlankEmpty prints one so). A merge is read as its diff against its first parent.
 # --text: a binary file's change is printed as lines too, not as "Binary files differ". The NUL bytes are taken out
-# of the whole log, so a line of UTF-16 text reads as plain text here as well; the line count is unchanged.
+# of the whole log, so a line of UTF-16 text reads as plain text here as well; the line count is unchanged. Both logs
+# are searched, as the tree's files are: a NUL can be the byte that ends the word before a key, and taking it out
+# closes the gap the pattern needs ("Z", NUL, "sk-..." reads "Zsk-..."). The log decoded (u16) is searched as well,
+# for UTF-16 text where a character that is not ASCII stands before the key; it keeps the log's line numbers too.
 if [ -n "$base" ]; then
   git log -p --text --no-color --no-ext-diff --no-textconv --no-renames --diff-merges=first-parent \
     --src-prefix=a/ --dst-prefix=b/ --format='commit %H' "$range" > "$work/log.raw" || setup "git log failed on $range"
   tr -d '\000' < "$work/log.raw" > "$work/log" || setup "can't read the log of $range"
+  perl -e "$u16" -- "$work/log.raw" "$work/log16" || setup "can't decode the log of $range"
   awk 'BEGIN { OFS = "\t" }
     old <= 0 && new <= 0 && /^commit [0-9a-f]+$/ { sha = substr($2, 1, 12); next }
     old <= 0 && new <= 0 && /^\+\+\+ / {
@@ -166,7 +253,7 @@ if [ -n "$base" ]; then
       else if (c == " " || $0 == "") { line++; old--; new-- }
     }' "$work/log" > "$work/added"
   for i in "${!res[@]}"; do
-    command grep -anE -e "${res[$i]}" "$work/log" | cut -d: -f1 > "$work/at"
+    command grep -ahnE -e "${res[$i]}" "$work/log.raw" "$work/log" "$work/log16".{0..3} | cut -d: -f1 > "$work/at"
     [ -s "$work/at" ] || continue
     awk -F '\t' -v name="${names[$i]}" 'FILENAME == ARGV[1] { hit[$1] = 1; next } $1 in hit { print "  commit " $2 " " $3 ":" $4 ": " name }' \
       "$work/at" "$work/added" >> "$work/hits"

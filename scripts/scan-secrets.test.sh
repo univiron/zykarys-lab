@@ -9,7 +9,7 @@ set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 scan=${1:-$here/scan-secrets.sh}
 setup() { echo "SETUP: $*" >&2; exit 2; }
-for t in git bash mktemp; do command -v "$t" >/dev/null || setup "$t not on PATH"; done
+for t in git bash mktemp perl sed seq; do command -v "$t" >/dev/null || setup "$t not on PATH"; done
 [ -r "$scan" ] || setup "can't read $scan"
 scan=$(cd "$(dirname "$scan")" && pwd)/$(basename "$scan")
 T=$(mktemp -d "${TMPDIR:-/tmp}/scan-secrets-test.XXXXXX") || setup "can't create a scratch directory"
@@ -100,6 +100,14 @@ git -C "$r" commit -q -m add; git -C "$r" rm -q blob.bin; git -C "$r" commit -q 
 run "$r"; if [ "$rc" = 0 ]; then ok; else bad "a removed file still fails the tree scan"; fi
 run "$r" --history; if [ "$rc" = 1 ] && command grep -q 'commit [0-9a-f]* blob.bin:1: github-token' <<<"$out"; then ok; else bad "a key in a binary file's history was missed (rc=$rc)"; fi
 
+# 3b. A NUL that is the only byte between a word and a key: taking the NULs out closes that gap, so the history must
+# be read as it is as well. (univiron-mcp's repro, 2026-11-18.)
+r=$T/nulb; newrepo "$r"
+printf 'Z\0s''k-ant-api03-%s\nZ\0s''k-%s\n' "$(m 48)" "$(m 48)" > "$r/rec.bin"; git -C "$r" add rec.bin
+run "$r"; if [ "$rc" = 1 ] && command grep -qF 'rec.bin:1: anthropic-key' <<<"$out" && command grep -qF 'rec.bin:2: sk-key' <<<"$out"; then ok; else bad "a key right after a NUL was missed in the tree (rc=$rc)"; fi
+git -C "$r" commit -q -m add; git -C "$r" rm -q rec.bin; git -C "$r" commit -q -m remove
+run "$r" --history; if [ "$rc" = 1 ] && command grep -q 'commit [0-9a-f]* rec.bin:1: anthropic-key' <<<"$out" && command grep -q 'commit [0-9a-f]* rec.bin:2: sk-key' <<<"$out"; then ok; else bad "a key right after a NUL was missed in the history (rc=$rc)"; fi
+
 # 4. A key committed and then removed: the tree is clean, the base and the whole history are not.
 r=$T/hist; newrepo "$r"; base=$(git -C "$r" rev-parse HEAD)
 printf 'k=gh''p_%s\n' "$(m 36)" > "$r/k.txt"; git -C "$r" add k.txt; git -C "$r" commit -q -m add
@@ -119,7 +127,54 @@ r=$T/u16; newrepo "$r"
 { printf 'first line\nk=gh''p_%s\n' "$(m 36)" | sed 's/./&\x00/g; s/$/\x00/' | sed '1s/^/\xff\xfe/'; } > "$r/env.txt"; git -C "$r" add env.txt
 run "$r"; if [ "$rc" = 1 ] && command grep -qF 'env.txt:2: github-token' <<<"$out"; then ok; else bad "a key in UTF-16 text was missed in the tree (rc=$rc)"; fi
 git -C "$r" commit -q -m add; git -C "$r" rm -q env.txt; git -C "$r" commit -q -m remove
-run "$r" --history; if [ "$rc" = 1 ] && command grep -q 'env.txt:2: github-token' <<<"$out"; then ok; else bad "a key in UTF-16 text was missed in the history (rc=$rc)"; fi
+run "$r" --history; if [ "$rc" = 1 ] && command grep -q 'commit [0-9a-f]* env.txt:2: github-token' <<<"$out"; then ok; else bad "a key in UTF-16 text was missed in the history (rc=$rc)"; fi
+
+# 4d. UTF-16 text where a character that is not ASCII stands right before the key: キーは in front of it. Taking the
+# NULs out leaves that character's other byte against the key ("0sk-ant..."), so only decoding the text finds it.
+# Little and big endian, with and without a byte-order mark, at an odd byte offset, and after 《 (U+300A, whose low
+# byte is a newline, so the line is split inside it), each in the tree and in the history after it is removed.
+le() { printf '%s' "$1" | sed 's/./&\x00/g'; }
+be() { printf '%s' "$1" | sed 's/./\x00&/g'; }
+key="s${q}k-ant-api03-$(m 48)"
+u16() { # NAME LINE [PATTERN]: the file comes from stdin; the key is reported at LINE in the tree and the history.
+  local name=$1 line=$2 pat=${3:-anthropic-key}; r=$T/u16-$name; newrepo "$r"; cat > "$r/$name.txt"; git -C "$r" add -- "$name.txt"
+  run "$r"; if [ "$rc" = 1 ] && command grep -qF -e "$name.txt:$line: $pat" <<<"$out"; then ok; else bad "UTF-16 $name: the key was missed in the tree (rc=$rc)"; fi
+  git -C "$r" commit -q -m add; git -C "$r" rm -q -- "$name.txt"; git -C "$r" commit -q -m remove
+  run "$r" --history; if [ "$rc" = 1 ] && command grep -q "commit [0-9a-f]* $name.txt:$line: $pat" <<<"$out"; then ok; else bad "UTF-16 $name: the key was missed in the history (rc=$rc)"; fi
+}
+u16 le-bom 2 < <(printf '\xff\xfe'; le 'first line'; printf '\n\0\xad\x30\xfc\x30\x6f\x30'; le "$key"; printf '\n\0')
+u16 le 2 < <(le 'first line'; printf '\n\0\xad\x30\xfc\x30\x6f\x30'; le "$key"; printf '\n\0')
+u16 be-bom 2 < <(printf '\xfe\xff'; be 'first line'; printf '\0\n\x30\xad\x30\xfc\x30\x6f'; be "$key"; printf '\0\n')
+u16 be 2 < <(be 'first line'; printf '\0\n\x30\xad\x30\xfc\x30\x6f'; be "$key"; printf '\0\n')
+u16 odd-offset 1 < <(printf '\x7f\xad\x30\xfc\x30\x6f\x30'; le "$key")
+u16 bracket 2 < <(printf '\xff\xfe\x0a\x30'; le "$key"; printf '\x0b\x30')
+u16 odd-length 1 < <(printf '\xff\xfe\xad\x30\xfc\x30\x6f\x30'; le "$key"; printf 'Z')
+# A .env written by PowerShell's ">": the byte-order mark stands before the name on the first line, and the pattern
+# reads a name only from the line's start, so only the decoded reading, which drops the mark, finds it.
+u16 env-bom 1 assigned-secret < <(printf '\xff\xfe'; le "MY_API_TO${q}KEN=$(m 40)"; printf '\n\0')
+# The same with a tab after "export": a tab is kept, as the pattern reads it as a space.
+u16 env-tab 1 assigned-secret < <(printf '\xff\xfe'; le "export	MY_API_TO${q}KEN=$(m 40)"; printf '\n\0')
+# Letters before the kana: the kana must still end a word, not vanish ("ab" then the key would read "absk-ant").
+u16 word-kana 1 < <(printf '\xff\xfe'; le 'ab'; printf '\xad\x30'; le "$key")
+# Big endian at an odd offset, は right before the key.
+u16 be-odd-offset 1 < <(printf '\x7f\x30\xad\x30\x6f'; be "$key")
+# One long line, decoded in 64 KiB pieces: the key starts at byte 65530 and runs across the first piece's end, so
+# it is found only if the pieces join up in order.
+u16 long 1 < <(printf '\xff\xfe'; le "$(printf '%32763s' '')"; printf '\xad\x30'; le "$key")
+# 2,000 lines of plain text, then the UTF-16 key: the first NUL is 124 KB in, past the buffer grep judges a file
+# by, so the file is read whole to learn that it holds one.
+u16 late 2001 < <(for i in $(seq 1 2000); do echo "an ordinary line of plain text number $i padded out a little"; done; printf '\xad\x30'; le "$key"; printf '\n\0')
+# A file whose name starts with "-": decoding it must not read its name as a switch ("-v" would skip it, "-e..."
+# would run the name as code).
+u16 -v 2 < <(printf '\xff\xfe'; le 'first line'; printf '\n\0\xad\x30\xfc\x30\x6f\x30'; le "$key"; printf '\n\0')
+
+# 4e. Bytes that are not valid UTF-16 neither stop the scan nor hide a key another reading finds: a lone surrogate
+# right before a key (taking the NULs out finds it), and a blob of every byte value, which is clean.
+u16 surrogate 1 < <(printf '\xff\xfe\x00\xd8'; le "$key")
+r=$T/blob; newrepo "$r"
+every=$(for b in $(seq 0 255); do printf '\\%03o' "$b"; done)
+printf "$every$every$every$every" > "$r/all.bin"; git -C "$r" add all.bin
+run "$r"; if [ "$rc" = 0 ]; then ok; else bad "a blob of every byte value was not clean (rc=$rc): $out"; fi
 
 # 5. What can't be scanned is exit 2, never clean.
 run "$r" no-such-commit; if [ "$rc" = 2 ]; then ok; else bad "an unknown BASE gave rc=$rc, wanted 2"; fi
